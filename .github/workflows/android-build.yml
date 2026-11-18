@@ -46,7 +46,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Nearnet-share-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: NetSetu-all-APK-variants
+          path: app/build/outputs/apk/debug/**/*.apk
           if-no-files-found: error
           retention-days: 14
