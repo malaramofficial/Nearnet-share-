@@ -10,10 +10,12 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.network.CellularNetworkManager
 import com.example.network.ProxyBridgeServer
 import com.example.network.ProxyMetricsSnapshot
 import com.example.network.RelayFriendTunnel
@@ -38,6 +40,8 @@ class ProxyBridgeService : Service() {
   private var directServer: ProxyBridgeServer? = null
   private var relayHost: RelayHostTunnel? = null
   private var relayFriend: RelayFriendTunnel? = null
+  private var cellularManager: CellularNetworkManager? = null
+  private var wakeLock: PowerManager.WakeLock? = null
 
   override fun onCreate() {
     super.onCreate()
@@ -51,13 +55,15 @@ class ProxyBridgeService : Service() {
     }
 
     val modeName = intent?.getStringExtra(EXTRA_MODE) ?: ServiceBridgeMode.HOST_DIRECT.name
-    val mode = runCatching { ServiceBridgeMode.valueOf(modeName) }.getOrDefault(ServiceBridgeMode.HOST_DIRECT)
+    val mode =
+      runCatching { ServiceBridgeMode.valueOf(modeName) }.getOrDefault(ServiceBridgeMode.HOST_DIRECT)
     val port = intent?.getIntExtra(EXTRA_PORT, 8888) ?: 8888
     val pin = intent?.getStringExtra(EXTRA_PIN)?.takeIf { it.isNotBlank() }
     val relayUrl = intent?.getStringExtra(EXTRA_RELAY_URL).orEmpty()
     val roomCode = intent?.getStringExtra(EXTRA_ROOM_CODE).orEmpty()
 
-    val notification = buildNotification(port = port, bytesRelayed = 0L, activeClients = 0, mode = mode)
+    val notification =
+      buildNotification(port = port, bytesRelayed = 0L, activeClients = 0, mode = mode)
     ServiceCompat.startForeground(
       this,
       NOTIFICATION_ID,
@@ -70,7 +76,15 @@ class ProxyBridgeService : Service() {
     )
 
     stopActiveEnginesOnly()
+    acquireBridgeWakeLock()
     _activeModeState.value = mode
+
+    val netManager =
+      CellularNetworkManager(this) {
+        relayHost?.onNetworkChanged()
+        relayFriend?.onNetworkChanged()
+      }.also { it.start() }
+    cellularManager = netManager
 
     val onMetrics: (ProxyMetricsSnapshot) -> Unit = { snapshot ->
       _metricsState.value = snapshot
@@ -88,23 +102,66 @@ class ProxyBridgeService : Service() {
 
     when (mode) {
       ServiceBridgeMode.HOST_DIRECT -> {
-        val server = ProxyBridgeServer(port = port, requiredPin = pin, scope = serviceScope, onMetricsChanged = onMetrics)
+        val server =
+          ProxyBridgeServer(
+            port = port,
+            requiredPin = pin,
+            scope = serviceScope,
+            onMetricsChanged = onMetrics,
+          )
         directServer = server
         server.start()
       }
       ServiceBridgeMode.HOST_RELAY -> {
-        val host = RelayHostTunnel(relayUrl = relayUrl, roomCode = roomCode, pin = pin, scope = serviceScope, onMetricsChanged = onMetrics)
+        val host =
+          RelayHostTunnel(
+            relayUrl = relayUrl,
+            roomCode = roomCode,
+            pin = pin,
+            scope = serviceScope,
+            cellularManager = netManager,
+            onMetricsChanged = onMetrics,
+          )
         relayHost = host
         host.start()
       }
       ServiceBridgeMode.FRIEND_RELAY -> {
-        val friend = RelayFriendTunnel(localPort = port, relayUrl = relayUrl, roomCode = roomCode, pin = pin, scope = serviceScope, onMetricsChanged = onMetrics)
+        val friend =
+          RelayFriendTunnel(
+            localPort = port,
+            relayUrl = relayUrl,
+            roomCode = roomCode,
+            pin = pin,
+            scope = serviceScope,
+            cellularManager = netManager,
+            onMetricsChanged = onMetrics,
+          )
         relayFriend = friend
         friend.start()
       }
     }
 
     return START_STICKY
+  }
+
+  private fun acquireBridgeWakeLock() {
+    if (wakeLock?.isHeld == true) return
+    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+    wakeLock =
+      pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "NetSetu::BridgeWakeLock").apply {
+        setReferenceCounted(false)
+        // Safety cap 6 hours; re-acquired cleanly on restart
+        acquire(6 * 60 * 60 * 1000L)
+      }
+  }
+
+  private fun releaseBridgeWakeLock() {
+    runCatching {
+      if (wakeLock?.isHeld == true) {
+        wakeLock?.release()
+      }
+    }
+    wakeLock = null
   }
 
   private fun stopActiveEnginesOnly() {
@@ -114,6 +171,9 @@ class ProxyBridgeService : Service() {
     relayHost = null
     relayFriend?.stop()
     relayFriend = null
+    cellularManager?.stop()
+    cellularManager = null
+    releaseBridgeWakeLock()
   }
 
   private fun stopAllInternal() {
@@ -128,6 +188,7 @@ class ProxyBridgeService : Service() {
         lastError = null,
         relayConnected = false,
         peerOnline = false,
+        cellularBound = false,
       )
     ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     stopSelf()
@@ -166,9 +227,7 @@ class ProxyBridgeService : Service() {
       PendingIntent.getActivity(
         this,
         0,
-        Intent(this, MainActivity::class.java).apply {
-          flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-        },
+        Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_SINGLE_TOP },
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
       )
 
@@ -273,9 +332,7 @@ class ProxyBridgeService : Service() {
 
     fun stop(context: Context) {
       val intent =
-        Intent(context, ProxyBridgeService::class.java).apply {
-          action = ACTION_STOP
-        }
+        Intent(context, ProxyBridgeService::class.java).apply { action = ACTION_STOP }
       context.startService(intent)
     }
 

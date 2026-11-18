@@ -29,6 +29,7 @@ data class ProxyMetricsSnapshot(
   val lastError: String?,
   val relayConnected: Boolean = false,
   val peerOnline: Boolean = false,
+  val cellularBound: Boolean = false,
 )
 
 class ProxyBridgeServer(

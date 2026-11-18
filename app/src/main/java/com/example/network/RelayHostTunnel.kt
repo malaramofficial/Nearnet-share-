@@ -26,13 +26,20 @@ class RelayHostTunnel(
   private val roomCode: String,
   private val pin: String?,
   private val scope: CoroutineScope,
+  private val cellularManager: CellularNetworkManager? = null,
   private val onMetricsChanged: (ProxyMetricsSnapshot) -> Unit,
 ) {
   private val client =
     OkHttpClient.Builder()
-      .pingInterval(20, TimeUnit.SECONDS)
+      .pingInterval(12, TimeUnit.SECONDS)
       .connectTimeout(45, TimeUnit.SECONDS)
       .readTimeout(0, TimeUnit.MILLISECONDS)
+      .apply {
+        if (cellularManager != null) {
+          socketFactory(cellularManager.delegatingSocketFactory)
+          dns(cellularManager.delegatingDns)
+        }
+      }
       .build()
 
   private class UpstreamSession(
@@ -166,13 +173,32 @@ class RelayHostTunnel(
       }
   }
 
+  fun onNetworkChanged() {
+    if (!running) return
+    emitMetrics()
+    if (!relayConnected) {
+      reconnectJob?.cancel()
+      reconnectJob =
+        scope.launch(Dispatchers.IO) {
+          delay(500)
+          if (running && !relayConnected) {
+            connectWebSocket()
+          }
+        }
+    }
+  }
+
   private fun openUpstream(streamId: Int, target: String) {
     scope.launch(Dispatchers.IO) {
       val host = target.substringBeforeLast(":").trim()
       val port = target.substringAfterLast(":", "443").trim().toIntOrNull() ?: 443
-      val socket = Socket()
+      val socket = cellularManager?.createBoundSocket() ?: Socket()
       try {
-        socket.connect(InetSocketAddress(host, port), 12_000)
+        val resolvedAddr = cellularManager?.resolveHost(host)?.firstOrNull()
+        val remoteEndpoint =
+          if (resolvedAddr != null) InetSocketAddress(resolvedAddr, port)
+          else InetSocketAddress(host, port)
+        socket.connect(remoteEndpoint, 12_000)
         socket.soTimeout = 60_000
         val writeChan = Channel<ByteArray>(capacity = 64)
         val session = UpstreamSession(socket, writeChan)
@@ -261,6 +287,7 @@ class RelayHostTunnel(
         lastError = lastError,
         relayConnected = relayConnected,
         peerOnline = peerOnline,
+        cellularBound = cellularManager?.bindingState?.value?.isCellularBound == true,
       )
     )
   }

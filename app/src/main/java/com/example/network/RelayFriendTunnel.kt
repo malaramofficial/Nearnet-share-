@@ -34,13 +34,20 @@ class RelayFriendTunnel(
   private val roomCode: String,
   private val pin: String?,
   private val scope: CoroutineScope,
+  private val cellularManager: CellularNetworkManager? = null,
   private val onMetricsChanged: (ProxyMetricsSnapshot) -> Unit,
 ) {
   private val client =
     OkHttpClient.Builder()
-      .pingInterval(20, TimeUnit.SECONDS)
+      .pingInterval(12, TimeUnit.SECONDS)
       .connectTimeout(45, TimeUnit.SECONDS)
       .readTimeout(0, TimeUnit.MILLISECONDS)
+      .apply {
+        if (cellularManager != null) {
+          socketFactory(cellularManager.delegatingSocketFactory)
+          dns(cellularManager.delegatingDns)
+        }
+      }
       .build()
 
   private class LocalClientSession(
@@ -187,6 +194,21 @@ class RelayFriendTunnel(
           connectWebSocket()
         }
       }
+  }
+
+  fun onNetworkChanged() {
+    if (!running) return
+    emitMetrics()
+    if (!relayConnected) {
+      reconnectJob?.cancel()
+      reconnectJob =
+        scope.launch(Dispatchers.IO) {
+          delay(500)
+          if (running && !relayConnected) {
+            connectWebSocket()
+          }
+        }
+    }
   }
 
   private fun startLocalProxyListener() {
@@ -445,6 +467,7 @@ class RelayFriendTunnel(
         lastError = lastError,
         relayConnected = relayConnected,
         peerOnline = peerOnline,
+        cellularBound = cellularManager?.bindingState?.value?.isCellularBound == true,
       )
     )
   }

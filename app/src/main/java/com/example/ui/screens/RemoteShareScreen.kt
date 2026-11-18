@@ -42,6 +42,7 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Wifi
@@ -424,22 +425,13 @@ private fun HostRoleContent(
             metrics.relayConnected -> strings.relayWaitingPeer
             else -> strings.relayConnecting
           }
-        Surface(
-          shape = MaterialTheme.shapes.small,
-          color =
-            if (metrics.peerOnline) signalColors.successContainer
-            else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
-          modifier = Modifier.fillMaxWidth(),
-        ) {
-          Text(
-            text = statusLabel,
-            style = MaterialTheme.typography.labelLarge,
-            color =
-              if (metrics.peerOnline) signalColors.success
-              else MaterialTheme.colorScheme.primary,
-            modifier = Modifier.padding(10.dp),
-          )
-        }
+        RelayStatusBanner(
+          statusText = statusLabel,
+          isPeerOnline = metrics.peerOnline,
+          cellularBound = metrics.cellularBound,
+          strings = strings,
+          testTagPrefix = "host_relay",
+        )
       }
 
       if (!metrics.lastError.isNullOrBlank()) {
@@ -837,26 +829,17 @@ private fun FriendRoleContent(
         if (isFriendRelayRunning) {
           val statusLabel =
             when {
-              metrics.relayConnected && metrics.peerOnline -> strings.relayConnectedOnline
-              metrics.relayConnected -> strings.relayWaitingPeer
+              metrics.relayConnected && metrics.peerOnline -> strings.relayFriendHostOnline
+              metrics.relayConnected -> strings.relayFriendHostOffline
               else -> strings.relayConnecting
             }
-          Surface(
-            shape = MaterialTheme.shapes.small,
-            color =
-              if (metrics.peerOnline) signalColors.successContainer
-              else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
-            modifier = Modifier.fillMaxWidth(),
-          ) {
-            Text(
-              text = "$statusLabel (127.0.0.1:8888)",
-              style = MaterialTheme.typography.labelLarge,
-              color =
-                if (metrics.peerOnline) signalColors.success
-                else MaterialTheme.colorScheme.primary,
-              modifier = Modifier.padding(10.dp),
-            )
-          }
+          RelayStatusBanner(
+            statusText = "$statusLabel (127.0.0.1:8888)",
+            isPeerOnline = metrics.peerOnline,
+            cellularBound = metrics.cellularBound,
+            strings = strings,
+            testTagPrefix = "friend_relay",
+          )
         }
 
         if (!metrics.lastError.isNullOrBlank()) {
@@ -1100,6 +1083,62 @@ private fun FriendRoleContent(
         )
         Spacer(modifier = Modifier.width(8.dp))
         Text(strings.openWifiSettings)
+      }
+    }
+  }
+}
+
+@Composable
+private fun RelayStatusBanner(
+  statusText: String,
+  isPeerOnline: Boolean,
+  cellularBound: Boolean,
+  strings: UiStrings,
+  testTagPrefix: String,
+) {
+  val signalColors = LocalSignalColors.current
+  Surface(
+    shape = MaterialTheme.shapes.small,
+    color =
+      if (isPeerOnline) signalColors.successContainer
+      else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+    modifier = Modifier.fillMaxWidth().testTag("${testTagPrefix}_status_banner"),
+  ) {
+    Column(
+      modifier = Modifier.padding(10.dp),
+      verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+      Text(
+        text = statusText,
+        style = MaterialTheme.typography.labelLarge,
+        color = if (isPeerOnline) signalColors.success else MaterialTheme.colorScheme.primary,
+      )
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.testTag("${testTagPrefix}_route_badge"),
+      ) {
+        Icon(
+          imageVector = Icons.Filled.SignalCellularAlt,
+          contentDescription = null,
+          tint =
+            if (cellularBound) signalColors.success
+            else signalColors.warning,
+          modifier = Modifier.size(16.dp),
+        )
+        Text(
+          text = if (cellularBound) strings.networkRouteCellular else strings.networkRouteFallback,
+          style = MaterialTheme.typography.bodySmall,
+          fontWeight = FontWeight.Medium,
+          color = MaterialTheme.colorScheme.onSurface,
+        )
+      }
+      if (!cellularBound) {
+        Text(
+          text = strings.networkRouteHint,
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
       }
     }
   }

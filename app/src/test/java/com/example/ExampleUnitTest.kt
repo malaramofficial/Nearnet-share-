@@ -2,10 +2,12 @@ package com.example
 
 import com.example.network.BridgeCodeCodec
 import com.example.network.DecodedBridgePayload
+import com.example.network.ProxyMetricsSnapshot
 import com.example.network.RelayFrameType
 import com.example.network.RelayProtocol
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -76,5 +78,21 @@ class ExampleUnitTest {
     assertTrue(ws!!.startsWith("wss://my-relay.onrender.com/ws?"))
     assertTrue(ws.contains("role=host"))
     assertTrue(ws.contains("room=482915"))
+  }
+
+  @Test
+  fun `proxy metrics snapshot defaults cellularBound to false`() {
+    val snapshot =
+      ProxyMetricsSnapshot(
+        isRunning = true,
+        port = 8888,
+        activeConnections = 0,
+        totalBytesRelayed = 0L,
+        clientIps = emptyList(),
+        lastError = null,
+      )
+    assertFalse(snapshot.cellularBound)
+    assertFalse(snapshot.relayConnected)
+    assertFalse(snapshot.peerOnline)
   }
 }
