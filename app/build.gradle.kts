@@ -12,6 +12,16 @@ android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
+  // Build device-specific APKs plus one universal APK for broad compatibility.
+  splits {
+    abi {
+      isEnable = true
+      reset()
+      include("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+      isUniversalApk = true
+    }
+  }
+
   defaultConfig {
     applicationId = "com.aistudio.netsetu.rtxmvw"
     minSdk = 24
