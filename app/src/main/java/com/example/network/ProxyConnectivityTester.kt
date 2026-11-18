@@ -40,8 +40,8 @@ object ProxyConnectivityTester {
       var sslSocket: SSLSocket? = null
 
       try {
-        rawSocket.connect(InetSocketAddress(cleanHost, port), 7000)
-        rawSocket.soTimeout = 7000
+        rawSocket.connect(InetSocketAddress(cleanHost, port), 10_000)
+        rawSocket.soTimeout = 15_000
 
         val rawOut = rawSocket.getOutputStream()
         val rawIn = rawSocket.getInputStream()
@@ -76,7 +76,7 @@ object ProxyConnectivityTester {
         val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
         sslSocket =
           (factory.createSocket(rawSocket, TARGET_HOST, TARGET_PORT, true) as SSLSocket).apply {
-            soTimeout = 7000
+            soTimeout = 15_000
             startHandshake()
           }
 

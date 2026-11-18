@@ -24,7 +24,28 @@ function sendStatus(ws, obj) {
   }
 }
 
+// Keep connections alive across Render / Railway / mobile NAT reverse proxies
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 20000);
+
+wss.on("close", () => {
+  clearInterval(heartbeatInterval);
+});
+
 wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
+
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const role = (url.searchParams.get("role") || "").toLowerCase();
   const room = (url.searchParams.get("room") || "").trim();
@@ -47,8 +68,9 @@ wss.on("connection", (ws, req) => {
     }
     entry.host = ws;
     entry.pin = pin;
-    sendStatus(ws, { type: "status", connected: true, peerOnline: Boolean(entry.friend) });
-    if (entry.friend) {
+    const friendAlive = Boolean(entry.friend && entry.friend.readyState === WebSocket.OPEN);
+    sendStatus(ws, { type: "status", connected: true, peerOnline: friendAlive });
+    if (friendAlive) {
       sendStatus(entry.friend, { type: "status", connected: true, peerOnline: true });
     }
   } else {
@@ -75,10 +97,12 @@ wss.on("connection", (ws, req) => {
     const peer = role === "host" ? entry.friend : entry.host;
     if (peer && peer.readyState === WebSocket.OPEN) {
       peer.send(data, { binary: true });
+    } else {
+      sendStatus(ws, { type: "status", connected: true, peerOnline: false });
     }
   });
 
-  ws.on("close", () => {
+  const cleanup = () => {
     const current = rooms.get(room);
     if (!current) return;
     if (role === "host" && current.host === ws) {
@@ -95,7 +119,10 @@ wss.on("connection", (ws, req) => {
     if (!current.host && !current.friend) {
       rooms.delete(room);
     }
-  });
+  };
+
+  ws.on("close", cleanup);
+  ws.on("error", cleanup);
 });
 
 server.listen(PORT, () => {

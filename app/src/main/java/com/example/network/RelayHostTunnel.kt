@@ -31,7 +31,7 @@ class RelayHostTunnel(
   private val client =
     OkHttpClient.Builder()
       .pingInterval(20, TimeUnit.SECONDS)
-      .connectTimeout(12, TimeUnit.SECONDS)
+      .connectTimeout(45, TimeUnit.SECONDS)
       .readTimeout(0, TimeUnit.MILLISECONDS)
       .build()
 
@@ -130,7 +130,12 @@ class RelayHostTunnel(
           override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             relayConnected = false
             peerOnline = false
-            lastError = t.localizedMessage ?: "Relay disconnected"
+            lastError =
+              when {
+                response != null -> "Relay HTTP ${response.code} ${response.message}".trim()
+                !t.localizedMessage.isNullOrBlank() -> t.localizedMessage
+                else -> "${t.javaClass.simpleName}: Relay connection lost"
+              }
             closeAllSessions()
             emitMetrics()
             scheduleReconnect()

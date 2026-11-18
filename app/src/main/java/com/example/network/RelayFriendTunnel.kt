@@ -39,7 +39,7 @@ class RelayFriendTunnel(
   private val client =
     OkHttpClient.Builder()
       .pingInterval(20, TimeUnit.SECONDS)
-      .connectTimeout(12, TimeUnit.SECONDS)
+      .connectTimeout(45, TimeUnit.SECONDS)
       .readTimeout(0, TimeUnit.MILLISECONDS)
       .build()
 
@@ -150,7 +150,12 @@ class RelayFriendTunnel(
           override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             relayConnected = false
             peerOnline = false
-            lastError = t.localizedMessage ?: "Relay connection lost"
+            lastError =
+              when {
+                response != null -> "Relay HTTP ${response.code} ${response.message}".trim()
+                !t.localizedMessage.isNullOrBlank() -> t.localizedMessage
+                else -> "${t.javaClass.simpleName}: Relay connection lost"
+              }
             closeAllSessions()
             emitMetrics()
             scheduleReconnect()
@@ -242,7 +247,14 @@ class RelayFriendTunnel(
 
       val ws = webSocket
       if (ws == null || !relayConnected) {
-        val err = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"
+        val err = "HTTP/1.1 503 Relay Not Connected\r\nConnection: close\r\n\r\n"
+        clientOut.write(err.toByteArray(Charsets.US_ASCII))
+        clientOut.flush()
+        runCatching { clientSocket.close() }
+        return
+      }
+      if (!peerOnline) {
+        val err = "HTTP/1.1 502 Host Offline\r\nConnection: close\r\n\r\n"
         clientOut.write(err.toByteArray(Charsets.US_ASCII))
         clientOut.flush()
         runCatching { clientSocket.close() }
@@ -290,13 +302,24 @@ class RelayFriendTunnel(
 
       val deferred = CompletableDeferred<Result<Unit>>()
       pendingOpens[streamId] = deferred
-      ws.send(
-        RelayProtocol.encodeFrame(
-          streamId,
-          RelayFrameType.OPEN,
-          targetHostPort.toByteArray(Charsets.UTF_8),
+      val enqueued =
+        ws.send(
+          RelayProtocol.encodeFrame(
+            streamId,
+            RelayFrameType.OPEN,
+            targetHostPort.toByteArray(Charsets.UTF_8),
+          )
         )
-      )
+      if (!enqueued) {
+        pendingOpens.remove(streamId)
+        val err = "HTTP/1.1 503 Relay Send Failed\r\nConnection: close\r\n\r\n"
+        runCatching {
+          clientOut.write(err.toByteArray(Charsets.US_ASCII))
+          clientOut.flush()
+          clientSocket.close()
+        }
+        return
+      }
 
       val openResult =
         try {
