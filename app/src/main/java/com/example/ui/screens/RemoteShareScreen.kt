@@ -5,7 +5,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.widget.Toast
@@ -29,7 +28,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Hub
@@ -37,7 +38,6 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.NetworkCheck
-import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -51,6 +51,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -76,9 +77,11 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.example.i18n.UiStrings
 import com.example.network.BridgeCodeCodec
+import com.example.network.DecodedBridgePayload
 import com.example.network.InterfaceKind
 import com.example.network.TunnelTestResult
 import com.example.service.ProxyBridgeService
+import com.example.service.ServiceBridgeMode
 import com.example.ui.components.BridgeHeroCard
 import com.example.ui.components.CopyableIpRow
 import com.example.ui.components.SectionCard
@@ -112,7 +115,7 @@ fun RemoteShareScreen(
     item {
       BridgeHeroCard(
         isBridgeActive = metrics.isRunning,
-        port = if (metrics.isRunning) metrics.port else settings.proxyPort,
+        port = if (metrics.isRunning && metrics.port > 0) metrics.port else settings.proxyPort,
         upstreamStatus = uiState.upstreamStatus,
         strings = strings,
       )
@@ -171,70 +174,198 @@ private fun HostRoleContent(
   val settings = uiState.settings
   val metrics = uiState.proxyMetrics
 
+  var useRelay by rememberSaveable(settings.useRelayMode) { mutableStateOf(settings.useRelayMode) }
+  var relayUrl by rememberSaveable(settings.relayUrl) { mutableStateOf(settings.relayUrl) }
+  var roomCode by rememberSaveable(settings.roomCode) { mutableStateOf(settings.roomCode) }
   var selectedPort by rememberSaveable(settings.proxyPort) { mutableStateOf(settings.proxyPort) }
   var requirePin by rememberSaveable(settings.requirePin) { mutableStateOf(settings.requirePin) }
   var pinInput by rememberSaveable(settings.proxyPin) { mutableStateOf(settings.proxyPin) }
+  var showDeployHelp by rememberSaveable { mutableStateOf(false) }
+  var relayUrlError by rememberSaveable { mutableStateOf(false) }
+
+  val isHostRunning =
+    metrics.isRunning && uiState.activeServiceMode != ServiceBridgeMode.FRIEND_RELAY
+
+  val startAction: () -> Unit = {
+    if (isHostRunning) {
+      viewModel.stopBridge()
+    } else if (useRelay) {
+      if (relayUrl.isBlank()) {
+        relayUrlError = true
+      } else {
+        relayUrlError = false
+        viewModel.updateRelayConfig(true, relayUrl, roomCode)
+        viewModel.startRelayHost(relayUrl, roomCode, requirePin, pinInput)
+      }
+    } else {
+      viewModel.startDirectHost(selectedPort, requirePin, pinInput)
+    }
+  }
 
   val notificationPermissionLauncher =
     rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
-      viewModel.startOrStopBridge(
-        currentlyRunning = metrics.isRunning,
-        port = selectedPort,
-        requirePin = requirePin,
-        pin = pinInput,
-      )
+      startAction()
     }
 
-  val activePort = if (metrics.isRunning) metrics.port else selectedPort
-  val preferredAddress =
-    uiState.activeAddresses.firstOrNull { it.kind == InterfaceKind.REMOTE_TUNNEL }
-      ?: uiState.activeAddresses.firstOrNull { it.kind == InterfaceKind.LOCAL_NETWORK }
-      ?: uiState.activeAddresses.firstOrNull()
-
-  val bridgeCode =
-    preferredAddress?.let { addr ->
-      BridgeCodeCodec.encode(
-        host = addr.ipAddress,
-        port = activePort,
-        pin = if (requirePin) pinInput else null,
-      )
+  val shareCode: String? =
+    if (useRelay) {
+      if (relayUrl.isNotBlank() && roomCode.isNotBlank()) {
+        BridgeCodeCodec.encodeRelay(relayUrl, roomCode, if (requirePin) pinInput else null)
+      } else null
+    } else {
+      val localAddr =
+        uiState.activeAddresses.firstOrNull { it.kind == InterfaceKind.LOCAL_NETWORK }
+      localAddr?.let {
+        BridgeCodeCodec.encodeDirect(it.ipAddress, selectedPort, if (requirePin) pinInput else null)
+      }
     }
 
   Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-    // 1. Start/Stop Remote Bridge
+    // Method selector: Self-Reliant Relay vs Direct IP
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+      FilterChip(
+        selected = useRelay,
+        enabled = !isHostRunning,
+        onClick = {
+          useRelay = true
+          viewModel.updateRelayConfig(true, relayUrl, roomCode)
+        },
+        label = { Text(strings.relayMethodLabel) },
+        modifier = Modifier.weight(1f).testTag("host_mode_relay_chip"),
+      )
+      FilterChip(
+        selected = !useRelay,
+        enabled = !isHostRunning,
+        onClick = {
+          useRelay = false
+          viewModel.updateRelayConfig(false, relayUrl, roomCode)
+        },
+        label = { Text(strings.directMethodLabel) },
+        modifier = Modifier.weight(1f).testTag("host_mode_direct_chip"),
+      )
+    }
+
+    // 1. Host Bridge Control
     SectionCard(
       borderColor =
-        if (metrics.isRunning) signalColors.success.copy(alpha = 0.7f)
+        if (isHostRunning) signalColors.success.copy(alpha = 0.7f)
         else MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)
     ) {
       SectionHeader(
-        icon = Icons.Filled.Hub,
-        title = strings.hostControlTitle,
-        subtitle = strings.hostControlDesc,
+        icon = if (useRelay) Icons.Filled.CloudQueue else Icons.Filled.Hub,
+        title = if (useRelay) strings.hostRelayTitle else strings.hostDirectTitle,
+        subtitle = if (useRelay) strings.hostRelayDesc else strings.hostDirectDesc,
         accentColor = MaterialTheme.colorScheme.primary,
       )
 
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-      ) {
-        Text(
-          text = "${strings.portLabel}:",
-          style = MaterialTheme.typography.labelLarge,
-          color = MaterialTheme.colorScheme.onSurfaceVariant,
+      if (useRelay) {
+        OutlinedTextField(
+          value = relayUrl,
+          onValueChange = {
+            relayUrl = it
+            relayUrlError = false
+            viewModel.updateRelayConfig(true, it, roomCode)
+          },
+          enabled = !isHostRunning,
+          label = { Text(strings.relayUrlLabel) },
+          placeholder = { Text(strings.relayUrlHint) },
+          isError = relayUrlError,
+          supportingText =
+            if (relayUrlError) {
+              { Text(strings.relayUrlMissingError) }
+            } else null,
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth().testTag("relay_url_input"),
         )
-        listOf(8888, 8080, 9090).forEach { portOption ->
-          FilterChip(
-            selected = selectedPort == portOption,
-            onClick = {
-              selectedPort = portOption
-              viewModel.updateProxyConfig(portOption, requirePin, pinInput)
+
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+          OutlinedTextField(
+            value = roomCode,
+            onValueChange = { next ->
+              val clean = next.filter { it.isLetterOrDigit() }.take(10)
+              roomCode = clean
+              viewModel.updateRelayConfig(true, relayUrl, clean)
             },
-            enabled = !metrics.isRunning,
-            label = { Text(portOption.toString(), fontFamily = JetBrainsMonoFamily) },
-            modifier = Modifier.testTag("port_chip_$portOption"),
+            enabled = !isHostRunning,
+            label = { Text(strings.roomCodeLabel) },
+            singleLine = true,
+            modifier = Modifier.weight(1f).testTag("room_code_input"),
           )
+          IconButton(
+            onClick = {
+              if (!isHostRunning) {
+                viewModel.regenerateRoomCode()
+              }
+            },
+            enabled = !isHostRunning,
+            modifier = Modifier.minimumInteractiveComponentSize().testTag("regen_room_btn"),
+          ) {
+            Icon(
+              imageVector = Icons.Filled.Autorenew,
+              contentDescription = strings.newRoomBtn,
+              tint = MaterialTheme.colorScheme.primary,
+            )
+          }
+        }
+
+        TextButton(
+          onClick = { showDeployHelp = !showDeployHelp },
+          modifier = Modifier.testTag("toggle_deploy_help_btn"),
+        ) {
+          Icon(
+            imageVector = Icons.Filled.Info,
+            contentDescription = null,
+            modifier = Modifier.size(16.dp),
+          )
+          Spacer(modifier = Modifier.width(6.dp))
+          Text(strings.howToDeployRelayTitle)
+        }
+
+        AnimatedVisibility(visible = showDeployHelp) {
+          Surface(
+            shape = MaterialTheme.shapes.small,
+            color = signalColors.warningContainer.copy(alpha = 0.45f),
+            border = BorderStroke(1.dp, signalColors.warning.copy(alpha = 0.6f)),
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            Text(
+              text = strings.howToDeployRelayBody,
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onSurface,
+              modifier = Modifier.padding(12.dp),
+            )
+          }
+        }
+      } else {
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp),
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Text(
+            text = "${strings.portLabel}:",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+          listOf(8888, 8080, 9090).forEach { portOption ->
+            FilterChip(
+              selected = selectedPort == portOption,
+              onClick = {
+                selectedPort = portOption
+                viewModel.updateProxyConfig(portOption, requirePin, pinInput)
+              },
+              enabled = !isHostRunning,
+              label = { Text(portOption.toString(), fontFamily = JetBrainsMonoFamily) },
+              modifier = Modifier.testTag("port_chip_$portOption"),
+            )
+          }
         }
       }
 
@@ -261,7 +392,7 @@ private fun HostRoleContent(
         }
         Switch(
           checked = requirePin,
-          enabled = !metrics.isRunning,
+          enabled = !isHostRunning,
           onCheckedChange = { checked ->
             requirePin = checked
             viewModel.updateProxyConfig(selectedPort, checked, pinInput)
@@ -278,12 +409,37 @@ private fun HostRoleContent(
             pinInput = digits
             viewModel.updateProxyConfig(selectedPort, requirePin, digits)
           },
-          enabled = !metrics.isRunning,
+          enabled = !isHostRunning,
           label = { Text(strings.pinValueLabel) },
           singleLine = true,
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
           modifier = Modifier.fillMaxWidth().testTag("proxy_pin_input"),
         )
+      }
+
+      if (isHostRunning && useRelay) {
+        val statusLabel =
+          when {
+            metrics.relayConnected && metrics.peerOnline -> strings.relayConnectedOnline
+            metrics.relayConnected -> strings.relayWaitingPeer
+            else -> strings.relayConnecting
+          }
+        Surface(
+          shape = MaterialTheme.shapes.small,
+          color =
+            if (metrics.peerOnline) signalColors.successContainer
+            else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+          modifier = Modifier.fillMaxWidth(),
+        ) {
+          Text(
+            text = statusLabel,
+            style = MaterialTheme.typography.labelLarge,
+            color =
+              if (metrics.peerOnline) signalColors.success
+              else MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(10.dp),
+          )
+        }
       }
 
       if (!metrics.lastError.isNullOrBlank()) {
@@ -296,24 +452,19 @@ private fun HostRoleContent(
 
       Button(
         onClick = {
-          if (!metrics.isRunning && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+          if (!isHostRunning && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
           } else {
-            viewModel.startOrStopBridge(
-              currentlyRunning = metrics.isRunning,
-              port = selectedPort,
-              requirePin = requirePin,
-              pin = pinInput,
-            )
+            startAction()
           }
         },
         colors =
           ButtonDefaults.buttonColors(
             containerColor =
-              if (metrics.isRunning) MaterialTheme.colorScheme.error
+              if (isHostRunning) MaterialTheme.colorScheme.error
               else MaterialTheme.colorScheme.primary,
             contentColor =
-              if (metrics.isRunning) MaterialTheme.colorScheme.onError
+              if (isHostRunning) MaterialTheme.colorScheme.onError
               else MaterialTheme.colorScheme.onPrimary,
           ),
         modifier =
@@ -323,19 +474,19 @@ private fun HostRoleContent(
             .testTag("toggle_bridge_btn"),
       ) {
         Icon(
-          imageVector = if (metrics.isRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+          imageVector = if (isHostRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
           contentDescription = null,
         )
         Spacer(modifier = Modifier.width(8.dp))
         Text(
-          text = if (metrics.isRunning) strings.stopBridge else strings.startBridge,
+          text = if (isHostRunning) strings.stopBridge else strings.startBridge,
           style = MaterialTheme.typography.titleMedium,
           fontWeight = FontWeight.Bold,
         )
       }
     }
 
-    // 2. Share Bridge Code & Active IPs
+    // 2. Share Bridge Code
     SectionCard {
       Row(
         modifier = Modifier.fillMaxWidth(),
@@ -355,21 +506,23 @@ private fun HostRoleContent(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
           )
         }
-        TextButton(
-          onClick = { viewModel.refreshNetworkState() },
-          modifier = Modifier.minimumInteractiveComponentSize().testTag("refresh_ips_btn"),
-        ) {
-          Icon(
-            imageVector = Icons.Filled.Refresh,
-            contentDescription = strings.refreshInterfaces,
-            modifier = Modifier.size(18.dp),
-          )
-          Spacer(modifier = Modifier.width(4.dp))
-          Text(strings.refreshInterfaces)
+        if (!useRelay) {
+          TextButton(
+            onClick = { viewModel.refreshNetworkState() },
+            modifier = Modifier.minimumInteractiveComponentSize().testTag("refresh_ips_btn"),
+          ) {
+            Icon(
+              imageVector = Icons.Filled.Refresh,
+              contentDescription = strings.refreshInterfaces,
+              modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(strings.refreshInterfaces)
+          }
         }
       }
 
-      if (bridgeCode != null && preferredAddress != null) {
+      if (shareCode != null) {
         Surface(
           shape = MaterialTheme.shapes.small,
           color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
@@ -386,9 +539,9 @@ private fun HostRoleContent(
               color = MaterialTheme.colorScheme.primary,
             )
             Text(
-              text = bridgeCode,
+              text = shareCode,
               fontFamily = JetBrainsMonoFamily,
-              style = MaterialTheme.typography.titleMedium,
+              style = MaterialTheme.typography.bodyMedium,
               fontWeight = FontWeight.Bold,
               color = MaterialTheme.colorScheme.onSurface,
             )
@@ -398,7 +551,7 @@ private fun HostRoleContent(
             ) {
               OutlinedButton(
                 onClick = {
-                  copyTextToClipboard(context, bridgeCode)
+                  copyTextToClipboard(context, shareCode)
                   Toast.makeText(context, strings.copiedFeedback, Toast.LENGTH_SHORT).show()
                 },
                 modifier =
@@ -416,9 +569,8 @@ private fun HostRoleContent(
                 onClick = {
                   shareBridgeInvite(
                     context = context,
-                    bridgeCode = bridgeCode,
-                    ip = preferredAddress.ipAddress,
-                    port = activePort,
+                    bridgeCode = shareCode,
+                    roomOrEndpoint = if (useRelay) "Room $roomCode" else "Port $selectedPort",
                     pin = if (requirePin) pinInput else null,
                   )
                 },
@@ -436,77 +588,62 @@ private fun HostRoleContent(
             }
           }
         }
-      }
-
-      if (uiState.activeAddresses.isEmpty()) {
+      } else if (useRelay) {
         Surface(
           shape = MaterialTheme.shapes.small,
           color = MaterialTheme.colorScheme.surfaceVariant,
           modifier = Modifier.fillMaxWidth(),
         ) {
           Text(
-            text = strings.noReachableIpHint,
+            text = strings.relayUrlMissingError,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(12.dp),
           )
         }
-      } else {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-          uiState.activeAddresses.forEach { addr ->
-            CopyableIpRow(
-              addressInfo = addr,
-              port = activePort,
-              strings = strings,
-              onCopy = { endpoint ->
-                copyTextToClipboard(context, endpoint)
-                Toast.makeText(context, strings.copiedFeedback, Toast.LENGTH_SHORT).show()
-              },
-              onShare = { endpoint ->
-                val ip = endpoint.substringBefore(":")
-                val code =
-                  BridgeCodeCodec.encode(ip, activePort, if (requirePin) pinInput else null)
-                shareBridgeInvite(
-                  context = context,
-                  bridgeCode = code,
-                  ip = ip,
-                  port = activePort,
-                  pin = if (requirePin) pinInput else null,
-                )
-              },
+      }
+
+      if (!useRelay) {
+        val localAddresses =
+          uiState.activeAddresses.filter { it.kind == InterfaceKind.LOCAL_NETWORK }
+        if (localAddresses.isEmpty()) {
+          Surface(
+            shape = MaterialTheme.shapes.small,
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            Text(
+              text = strings.noReachableIpHint,
+              style = MaterialTheme.typography.bodyMedium,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+              modifier = Modifier.padding(12.dp),
             )
+          }
+        } else {
+          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            localAddresses.forEach { addr ->
+              CopyableIpRow(
+                addressInfo = addr,
+                port = selectedPort,
+                strings = strings,
+                onCopy = { endpoint ->
+                  copyTextToClipboard(context, endpoint)
+                  Toast.makeText(context, strings.copiedFeedback, Toast.LENGTH_SHORT).show()
+                },
+                onShare = { endpoint ->
+                  val ip = endpoint.substringBefore(":")
+                  val code =
+                    BridgeCodeCodec.encodeDirect(ip, selectedPort, if (requirePin) pinInput else null)
+                  shareBridgeInvite(context, code, endpoint, if (requirePin) pinInput else null)
+                },
+              )
+            }
           }
         }
       }
     }
 
-    // Remote CGNAT / Tailscale Tip (Concise, Essential Only)
-    SectionCard(
-      containerColor = signalColors.warningContainer.copy(alpha = 0.45f),
-      borderColor = signalColors.warning.copy(alpha = 0.65f),
-    ) {
-      SectionHeader(
-        icon = Icons.Filled.Info,
-        title = strings.remoteNoteTitle,
-        subtitle = strings.remoteNoteBody,
-        accentColor = signalColors.warning,
-      )
-      OutlinedButton(
-        onClick = { openTailscaleAppOrStore(context) },
-        modifier =
-          Modifier.fillMaxWidth().minimumInteractiveComponentSize().testTag("open_tailscale_btn"),
-      ) {
-        Icon(
-          imageVector = Icons.Filled.OpenInNew,
-          contentDescription = null,
-          modifier = Modifier.size(18.dp),
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(strings.openTailscaleBtn)
-      }
-    }
-
-    // Live Telemetry
+    // 3. Live Telemetry
     SectionCard {
       SectionHeader(
         icon = Icons.Filled.Speed,
@@ -563,9 +700,17 @@ private fun FriendRoleContent(
   val context = LocalContext.current
   val signalColors = LocalSignalColors.current
   val settings = uiState.settings
+  val metrics = uiState.proxyMetrics
 
+  var useRelay by rememberSaveable { mutableStateOf(true) }
   var codeInput by rememberSaveable { mutableStateOf("") }
   var codeError by rememberSaveable { mutableStateOf(false) }
+
+  // Relay fields
+  var relayUrl by rememberSaveable(settings.relayUrl) { mutableStateOf(settings.relayUrl) }
+  var roomCode by rememberSaveable { mutableStateOf("") }
+
+  // Direct fields
   var hostIp by rememberSaveable(settings.testTargetHost) {
     mutableStateOf(settings.testTargetHost)
   }
@@ -574,8 +719,39 @@ private fun FriendRoleContent(
   }
   var pinText by rememberSaveable { mutableStateOf("") }
 
+  val isFriendRelayRunning =
+    metrics.isRunning && uiState.activeServiceMode == ServiceBridgeMode.FRIEND_RELAY
+
+  val notificationPermissionLauncher =
+    rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
+      viewModel.startRelayFriend(
+        localPort = 8888,
+        relayUrl = relayUrl,
+        roomCode = roomCode,
+        pin = pinText.ifBlank { null },
+      )
+    }
+
   Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-    // 1. Paste Bridge Code & Test Tunnel
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+      FilterChip(
+        selected = useRelay,
+        onClick = { useRelay = true },
+        label = { Text(strings.relayMethodLabel) },
+        modifier = Modifier.weight(1f).testTag("friend_mode_relay_chip"),
+      )
+      FilterChip(
+        selected = !useRelay,
+        onClick = { useRelay = false },
+        label = { Text(strings.directMethodLabel) },
+        modifier = Modifier.weight(1f).testTag("friend_mode_direct_chip"),
+      )
+    }
+
+    // 1. Paste Code & Connect
     SectionCard {
       SectionHeader(
         icon = Icons.Filled.Key,
@@ -602,16 +778,26 @@ private fun FriendRoleContent(
 
       OutlinedButton(
         onClick = {
-          val decoded = BridgeCodeCodec.decode(codeInput)
-          if (decoded == null) {
-            codeError = true
-          } else {
-            codeError = false
-            hostIp = decoded.host
-            portText = decoded.port.toString()
-            pinText = decoded.pin
-            viewModel.updateTestTarget(decoded.host, decoded.port)
-            Toast.makeText(context, strings.codeAppliedFeedback, Toast.LENGTH_SHORT).show()
+          when (val decoded = BridgeCodeCodec.decode(codeInput)) {
+            null -> codeError = true
+            is DecodedBridgePayload.Relay -> {
+              codeError = false
+              useRelay = true
+              relayUrl = decoded.relayUrl
+              roomCode = decoded.roomCode
+              pinText = decoded.pin
+              viewModel.updateRelayConfig(true, decoded.relayUrl, decoded.roomCode)
+              Toast.makeText(context, strings.codeAppliedFeedback, Toast.LENGTH_SHORT).show()
+            }
+            is DecodedBridgePayload.Direct -> {
+              codeError = false
+              useRelay = false
+              hostIp = decoded.host
+              portText = decoded.port.toString()
+              pinText = decoded.pin
+              viewModel.updateTestTarget(decoded.host, decoded.port)
+              Toast.makeText(context, strings.codeAppliedFeedback, Toast.LENGTH_SHORT).show()
+            }
           }
         },
         modifier =
@@ -620,62 +806,161 @@ private fun FriendRoleContent(
         Text(strings.applyCodeBtn, fontWeight = FontWeight.SemiBold)
       }
 
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-      ) {
+      if (useRelay) {
         OutlinedTextField(
-          value = hostIp,
-          onValueChange = {
-            hostIp = it
-            viewModel.updateTestTarget(it, portText.toIntOrNull() ?: 8888)
-          },
-          label = { Text(strings.targetHostLabel) },
+          value = relayUrl,
+          onValueChange = { relayUrl = it },
+          enabled = !isFriendRelayRunning,
+          label = { Text(strings.relayUrlLabel) },
+          placeholder = { Text(strings.relayUrlHint) },
           singleLine = true,
-          modifier = Modifier.weight(2f).testTag("tester_host_input"),
+          modifier = Modifier.fillMaxWidth().testTag("friend_relay_url_input"),
         )
         OutlinedTextField(
-          value = portText,
-          onValueChange = { next ->
-            val digits = next.filter { it.isDigit() }.take(5)
-            portText = digits
-            viewModel.updateTestTarget(hostIp, digits.toIntOrNull() ?: 8888)
-          },
-          label = { Text(strings.targetPortLabel) },
+          value = roomCode,
+          onValueChange = { roomCode = it.filter { ch -> ch.isLetterOrDigit() }.take(10) },
+          enabled = !isFriendRelayRunning,
+          label = { Text(strings.roomCodeLabel) },
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth().testTag("friend_room_code_input"),
+        )
+        OutlinedTextField(
+          value = pinText,
+          onValueChange = { pinText = it.filter { ch -> ch.isDigit() }.take(6) },
+          enabled = !isFriendRelayRunning,
+          label = { Text(strings.optionalPinLabel) },
           singleLine = true,
           keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-          modifier = Modifier.weight(1f).testTag("tester_port_input"),
+          modifier = Modifier.fillMaxWidth().testTag("tester_pin_input"),
+        )
+
+        if (isFriendRelayRunning) {
+          val statusLabel =
+            when {
+              metrics.relayConnected && metrics.peerOnline -> strings.relayConnectedOnline
+              metrics.relayConnected -> strings.relayWaitingPeer
+              else -> strings.relayConnecting
+            }
+          Surface(
+            shape = MaterialTheme.shapes.small,
+            color =
+              if (metrics.peerOnline) signalColors.successContainer
+              else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            Text(
+              text = "$statusLabel (127.0.0.1:8888)",
+              style = MaterialTheme.typography.labelLarge,
+              color =
+                if (metrics.peerOnline) signalColors.success
+                else MaterialTheme.colorScheme.primary,
+              modifier = Modifier.padding(10.dp),
+            )
+          }
+        }
+
+        if (!metrics.lastError.isNullOrBlank()) {
+          Text(
+            text = metrics.lastError,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+          )
+        }
+
+        Button(
+          onClick = {
+            if (isFriendRelayRunning) {
+              viewModel.stopBridge()
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+              notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+              viewModel.startRelayFriend(8888, relayUrl, roomCode, pinText.ifBlank { null })
+            }
+          },
+          enabled = isFriendRelayRunning || (relayUrl.isNotBlank() && roomCode.isNotBlank()),
+          colors =
+            ButtonDefaults.buttonColors(
+              containerColor =
+                if (isFriendRelayRunning) MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.primary,
+              contentColor =
+                if (isFriendRelayRunning) MaterialTheme.colorScheme.onError
+                else MaterialTheme.colorScheme.onPrimary,
+            ),
+          modifier =
+            Modifier.fillMaxWidth()
+              .height(52.dp)
+              .minimumInteractiveComponentSize()
+              .testTag("toggle_friend_relay_btn"),
+        ) {
+          Icon(
+            imageVector = if (isFriendRelayRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+            contentDescription = null,
+          )
+          Spacer(modifier = Modifier.width(8.dp))
+          Text(
+            text =
+              if (isFriendRelayRunning) strings.stopRelayTunnelBtn
+              else strings.connectRelayTunnelBtn,
+            fontWeight = FontWeight.Bold,
+          )
+        }
+      } else {
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+          OutlinedTextField(
+            value = hostIp,
+            onValueChange = {
+              hostIp = it
+              viewModel.updateTestTarget(it, portText.toIntOrNull() ?: 8888)
+            },
+            label = { Text(strings.targetHostLabel) },
+            singleLine = true,
+            modifier = Modifier.weight(2f).testTag("tester_host_input"),
+          )
+          OutlinedTextField(
+            value = portText,
+            onValueChange = { next ->
+              val digits = next.filter { it.isDigit() }.take(5)
+              portText = digits
+              viewModel.updateTestTarget(hostIp, digits.toIntOrNull() ?: 8888)
+            },
+            label = { Text(strings.targetPortLabel) },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.weight(1f).testTag("tester_port_input"),
+          )
+        }
+
+        OutlinedTextField(
+          value = pinText,
+          onValueChange = { pinText = it.filter { ch -> ch.isDigit() }.take(6) },
+          label = { Text(strings.optionalPinLabel) },
+          singleLine = true,
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+          modifier = Modifier.fillMaxWidth().testTag("tester_pin_input"),
         )
       }
 
-      OutlinedTextField(
-        value = pinText,
-        onValueChange = { pinText = it.filter { ch -> ch.isDigit() }.take(6) },
-        label = { Text(strings.optionalPinLabel) },
-        singleLine = true,
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-        modifier = Modifier.fillMaxWidth().testTag("tester_pin_input"),
-      )
-
+      // Live Tunnel Connectivity Test button (tests 127.0.0.1:8888 in Relay Mode or hostIp:port in Direct Mode)
+      val testHost = if (useRelay) "127.0.0.1" else hostIp
+      val testPort = if (useRelay) 8888 else (portText.toIntOrNull() ?: 8888)
+      val testPin = if (useRelay) null else pinText.ifBlank { null }
       val isTesting = uiState.tunnelTestResult is TunnelTestResult.Testing
-      Button(
-        onClick = {
-          val port = portText.toIntOrNull() ?: 8888
-          viewModel.runProxyTunnelTest(hostIp, port, pinText.ifBlank { null })
-        },
-        enabled = !isTesting && hostIp.isNotBlank(),
+
+      OutlinedButton(
+        onClick = { viewModel.runProxyTunnelTest(testHost, testPort, testPin) },
+        enabled = !isTesting && ((!useRelay && hostIp.isNotBlank()) || isFriendRelayRunning),
         modifier =
           Modifier.fillMaxWidth()
-            .height(52.dp)
+            .height(50.dp)
             .minimumInteractiveComponentSize()
             .testTag("run_tunnel_test_btn"),
       ) {
         if (isTesting) {
-          CircularProgressIndicator(
-            modifier = Modifier.size(18.dp),
-            strokeWidth = 2.dp,
-            color = MaterialTheme.colorScheme.onPrimary,
-          )
+          CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
           Spacer(modifier = Modifier.width(8.dp))
           Text(strings.testingTunnel)
         } else {
@@ -710,7 +995,7 @@ private fun FriendRoleContent(
                   color = signalColors.success,
                 )
                 Text(
-                  text = "HTTP ${result.httpCode} • ${result.latencyMs} ms",
+                  text = "HTTPS ${result.httpCode} • ${result.latencyMs} ms",
                   fontFamily = JetBrainsMonoFamily,
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onSurface,
@@ -755,41 +1040,42 @@ private fun FriendRoleContent(
       }
     }
 
-    // 2. Apply System-Wide Wi-Fi Proxy on Borrowed Hotspot
+    // 2. Apply System Wi-Fi Proxy
     SectionCard {
       SectionHeader(
         icon = Icons.Filled.PhoneAndroid,
         title = strings.friendApplyTitle,
-        subtitle = strings.friendApplySteps,
+        subtitle = if (useRelay) strings.friendApplyRelaySteps else strings.friendApplyDirectSteps,
         accentColor = MaterialTheme.colorScheme.secondary,
       )
 
-      if (hostIp.isNotBlank()) {
-        Surface(
-          shape = MaterialTheme.shapes.small,
-          color = MaterialTheme.colorScheme.surfaceVariant,
-          modifier = Modifier.fillMaxWidth(),
+      val proxyHostDisplay = if (useRelay) "127.0.0.1" else hostIp.trim().ifBlank { "—" }
+      val proxyPortDisplay = if (useRelay) "8888" else portText.ifBlank { "8888" }
+
+      Surface(
+        shape = MaterialTheme.shapes.small,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+      ) {
+        Row(
+          modifier = Modifier.fillMaxWidth().padding(12.dp),
+          horizontalArrangement = Arrangement.SpaceBetween,
+          verticalAlignment = Alignment.CenterVertically,
         ) {
-          Row(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
+          Text(
+            text = "$proxyHostDisplay : $proxyPortDisplay",
+            fontFamily = JetBrainsMonoFamily,
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.primary,
+          )
+          OutlinedButton(
+            onClick = {
+              copyTextToClipboard(context, proxyHostDisplay)
+              Toast.makeText(context, strings.copiedFeedback, Toast.LENGTH_SHORT).show()
+            },
+            modifier = Modifier.minimumInteractiveComponentSize().testTag("copy_friend_host_btn"),
           ) {
-            Text(
-              text = "${hostIp.trim()} : ${portText.ifBlank { "8888" }}",
-              fontFamily = JetBrainsMonoFamily,
-              style = MaterialTheme.typography.titleMedium,
-              color = MaterialTheme.colorScheme.primary,
-            )
-            OutlinedButton(
-              onClick = {
-                copyTextToClipboard(context, hostIp.trim())
-                Toast.makeText(context, strings.copiedFeedback, Toast.LENGTH_SHORT).show()
-              },
-              modifier = Modifier.minimumInteractiveComponentSize().testTag("copy_friend_host_btn"),
-            ) {
-              Text(strings.copyCode)
-            }
+            Text(strings.copyCode)
           }
         }
       }
@@ -859,37 +1145,19 @@ private fun copyTextToClipboard(context: Context, text: String) {
 private fun shareBridgeInvite(
   context: Context,
   bridgeCode: String,
-  ip: String,
-  port: Int,
+  roomOrEndpoint: String,
   pin: String?,
 ) {
   val pinLine = if (!pin.isNullOrBlank()) "\nPIN: $pin" else ""
   val message =
-    "NetSetu Remote Internet Bridge:\n" +
-      "Code: $bridgeCode\n" +
-      "Host IP: $ip\n" +
-      "Port: $port$pinLine\n\n" +
+    "NetSetu Internet Bridge ($roomOrEndpoint):\n" +
+      "Code: $bridgeCode$pinLine\n\n" +
       "1. Kisi ke Hotspot se connect ho jaao\n" +
-      "2. NetSetu -> Friend mode me ye Code paste karo"
+      "2. NetSetu -> Friend mode me ye Code paste karke Connect dabao"
   val intent =
     Intent(Intent.ACTION_SEND).apply {
       type = "text/plain"
       putExtra(Intent.EXTRA_TEXT, message)
     }
   context.startActivity(Intent.createChooser(intent, "Send NetSetu Code"))
-}
-
-private fun openTailscaleAppOrStore(context: Context) {
-  val launchIntent = context.packageManager.getLaunchIntentForPackage("com.tailscale.ipn")
-  if (launchIntent != null) {
-    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    context.startActivity(launchIntent)
-    return
-  }
-  val playStoreIntent =
-    Intent(
-      Intent.ACTION_VIEW,
-      Uri.parse("https://play.google.com/store/apps/details?id=com.tailscale.ipn"),
-    ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
-  runCatching { context.startActivity(playStoreIntent) }
 }

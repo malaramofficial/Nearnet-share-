@@ -16,6 +16,8 @@ import com.example.MainActivity
 import com.example.R
 import com.example.network.ProxyBridgeServer
 import com.example.network.ProxyMetricsSnapshot
+import com.example.network.RelayFriendTunnel
+import com.example.network.RelayHostTunnel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -24,10 +26,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+enum class ServiceBridgeMode {
+  HOST_DIRECT,
+  HOST_RELAY,
+  FRIEND_RELAY,
+}
+
 class ProxyBridgeService : Service() {
 
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-  private var proxyServer: ProxyBridgeServer? = null
+  private var directServer: ProxyBridgeServer? = null
+  private var relayHost: RelayHostTunnel? = null
+  private var relayFriend: RelayFriendTunnel? = null
 
   override fun onCreate() {
     super.onCreate()
@@ -36,14 +46,18 @@ class ProxyBridgeService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     if (intent?.action == ACTION_STOP) {
-      stopBridgeInternal()
+      stopAllInternal()
       return START_NOT_STICKY
     }
 
+    val modeName = intent?.getStringExtra(EXTRA_MODE) ?: ServiceBridgeMode.HOST_DIRECT.name
+    val mode = runCatching { ServiceBridgeMode.valueOf(modeName) }.getOrDefault(ServiceBridgeMode.HOST_DIRECT)
     val port = intent?.getIntExtra(EXTRA_PORT, 8888) ?: 8888
     val pin = intent?.getStringExtra(EXTRA_PIN)?.takeIf { it.isNotBlank() }
+    val relayUrl = intent?.getStringExtra(EXTRA_RELAY_URL).orEmpty()
+    val roomCode = intent?.getStringExtra(EXTRA_ROOM_CODE).orEmpty()
 
-    val notification = buildNotification(port = port, bytesRelayed = 0L, activeClients = 0)
+    val notification = buildNotification(port = port, bytesRelayed = 0L, activeClients = 0, mode = mode)
     ServiceCompat.startForeground(
       this,
       NOTIFICATION_ID,
@@ -55,34 +69,55 @@ class ProxyBridgeService : Service() {
       },
     )
 
-    proxyServer?.stop()
-    val server =
-      ProxyBridgeServer(
-        port = port,
-        requiredPin = pin,
-        scope = serviceScope,
-        onMetricsChanged = { snapshot ->
-          _metricsState.value = snapshot
-          val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-          mgr?.notify(
-            NOTIFICATION_ID,
-            buildNotification(
-              port = snapshot.port,
-              bytesRelayed = snapshot.totalBytesRelayed,
-              activeClients = snapshot.activeConnections,
-            ),
-          )
-        },
+    stopActiveEnginesOnly()
+    _activeModeState.value = mode
+
+    val onMetrics: (ProxyMetricsSnapshot) -> Unit = { snapshot ->
+      _metricsState.value = snapshot
+      val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+      mgr?.notify(
+        NOTIFICATION_ID,
+        buildNotification(
+          port = snapshot.port,
+          bytesRelayed = snapshot.totalBytesRelayed,
+          activeClients = snapshot.activeConnections,
+          mode = mode,
+        ),
       )
-    proxyServer = server
-    server.start()
+    }
+
+    when (mode) {
+      ServiceBridgeMode.HOST_DIRECT -> {
+        val server = ProxyBridgeServer(port = port, requiredPin = pin, scope = serviceScope, onMetricsChanged = onMetrics)
+        directServer = server
+        server.start()
+      }
+      ServiceBridgeMode.HOST_RELAY -> {
+        val host = RelayHostTunnel(relayUrl = relayUrl, roomCode = roomCode, pin = pin, scope = serviceScope, onMetricsChanged = onMetrics)
+        relayHost = host
+        host.start()
+      }
+      ServiceBridgeMode.FRIEND_RELAY -> {
+        val friend = RelayFriendTunnel(localPort = port, relayUrl = relayUrl, roomCode = roomCode, pin = pin, scope = serviceScope, onMetricsChanged = onMetrics)
+        relayFriend = friend
+        friend.start()
+      }
+    }
 
     return START_STICKY
   }
 
-  private fun stopBridgeInternal() {
-    proxyServer?.stop()
-    proxyServer = null
+  private fun stopActiveEnginesOnly() {
+    directServer?.stop()
+    directServer = null
+    relayHost?.stop()
+    relayHost = null
+    relayFriend?.stop()
+    relayFriend = null
+  }
+
+  private fun stopAllInternal() {
+    stopActiveEnginesOnly()
     _metricsState.value =
       ProxyMetricsSnapshot(
         isRunning = false,
@@ -91,13 +126,15 @@ class ProxyBridgeService : Service() {
         totalBytesRelayed = _metricsState.value.totalBytesRelayed,
         clientIps = emptyList(),
         lastError = null,
+        relayConnected = false,
+        peerOnline = false,
       )
     ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     stopSelf()
   }
 
   override fun onDestroy() {
-    proxyServer?.stop()
+    stopActiveEnginesOnly()
     serviceScope.cancel()
     super.onDestroy()
   }
@@ -123,6 +160,7 @@ class ProxyBridgeService : Service() {
     port: Int,
     bytesRelayed: Long,
     activeClients: Int,
+    mode: ServiceBridgeMode,
   ): Notification {
     val openIntent =
       PendingIntent.getActivity(
@@ -143,11 +181,17 @@ class ProxyBridgeService : Service() {
       )
 
     val formattedBytes = formatByteCount(bytesRelayed)
+    val subtitle =
+      when (mode) {
+        ServiceBridgeMode.HOST_RELAY -> "Relay Host • $activeClients active • $formattedBytes"
+        ServiceBridgeMode.FRIEND_RELAY -> "127.0.0.1:$port • $activeClients active • $formattedBytes"
+        ServiceBridgeMode.HOST_DIRECT -> "Port $port • $activeClients active • $formattedBytes"
+      }
 
     return NotificationCompat.Builder(this, CHANNEL_ID)
       .setSmallIcon(R.drawable.ic_stat_bridge)
       .setContentTitle(getString(R.string.notification_bridge_title))
-      .setContentText("Port $port • $activeClients active • $formattedBytes")
+      .setContentText(subtitle)
       .setOngoing(true)
       .setContentIntent(openIntent)
       .addAction(0, getString(R.string.notification_bridge_stop), stopIntent)
@@ -159,8 +203,11 @@ class ProxyBridgeService : Service() {
     const val NOTIFICATION_ID = 4091
     const val ACTION_START = "com.example.action.START_BRIDGE"
     const val ACTION_STOP = "com.example.action.STOP_BRIDGE"
+    const val EXTRA_MODE = "extra_mode"
     const val EXTRA_PORT = "extra_port"
     const val EXTRA_PIN = "extra_pin"
+    const val EXTRA_RELAY_URL = "extra_relay_url"
+    const val EXTRA_ROOM_CODE = "extra_room_code"
 
     private val _metricsState =
       MutableStateFlow(
@@ -175,14 +222,47 @@ class ProxyBridgeService : Service() {
       )
     val metricsState: StateFlow<ProxyMetricsSnapshot> = _metricsState.asStateFlow()
 
-    fun start(context: Context, port: Int, pin: String?) {
+    private val _activeModeState = MutableStateFlow(ServiceBridgeMode.HOST_DIRECT)
+    val activeModeState: StateFlow<ServiceBridgeMode> = _activeModeState.asStateFlow()
+
+    fun startDirectHost(context: Context, port: Int, pin: String?) {
+      startWithExtras(context) {
+        putExtra(EXTRA_MODE, ServiceBridgeMode.HOST_DIRECT.name)
+        putExtra(EXTRA_PORT, port)
+        if (!pin.isNullOrBlank()) putExtra(EXTRA_PIN, pin)
+      }
+    }
+
+    fun startRelayHost(context: Context, relayUrl: String, roomCode: String, pin: String?) {
+      startWithExtras(context) {
+        putExtra(EXTRA_MODE, ServiceBridgeMode.HOST_RELAY.name)
+        putExtra(EXTRA_RELAY_URL, relayUrl)
+        putExtra(EXTRA_ROOM_CODE, roomCode)
+        if (!pin.isNullOrBlank()) putExtra(EXTRA_PIN, pin)
+      }
+    }
+
+    fun startRelayFriend(
+      context: Context,
+      localPort: Int,
+      relayUrl: String,
+      roomCode: String,
+      pin: String?,
+    ) {
+      startWithExtras(context) {
+        putExtra(EXTRA_MODE, ServiceBridgeMode.FRIEND_RELAY.name)
+        putExtra(EXTRA_PORT, localPort)
+        putExtra(EXTRA_RELAY_URL, relayUrl)
+        putExtra(EXTRA_ROOM_CODE, roomCode)
+        if (!pin.isNullOrBlank()) putExtra(EXTRA_PIN, pin)
+      }
+    }
+
+    private fun startWithExtras(context: Context, extras: Intent.() -> Unit) {
       val intent =
         Intent(context, ProxyBridgeService::class.java).apply {
           action = ACTION_START
-          putExtra(EXTRA_PORT, port)
-          if (!pin.isNullOrBlank()) {
-            putExtra(EXTRA_PIN, pin)
-          }
+          extras()
         }
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(intent)

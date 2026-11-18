@@ -12,6 +12,7 @@ import com.example.network.ProxyMetricsSnapshot
 import com.example.network.TunnelTestResult
 import com.example.network.UpstreamStatus
 import com.example.service.ProxyBridgeService
+import com.example.service.ServiceBridgeMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -23,6 +24,7 @@ import kotlinx.coroutines.launch
 data class MainUiState(
   val settings: BridgeSettings = BridgeSettings(),
   val proxyMetrics: ProxyMetricsSnapshot = ProxyBridgeService.metricsState.value,
+  val activeServiceMode: ServiceBridgeMode = ProxyBridgeService.activeModeState.value,
   val activeAddresses: List<NetworkAddressInfo> = emptyList(),
   val upstreamStatus: UpstreamStatus = UpstreamStatus(false, "Checking"),
   val tunnelTestResult: TunnelTestResult = TunnelTestResult.Idle,
@@ -40,13 +42,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     combine(
       prefs.settingsFlow,
       ProxyBridgeService.metricsState,
+      ProxyBridgeService.activeModeState,
       activeAddresses,
       upstreamStatus,
       tunnelTestResult,
-    ) { settings, metrics, addrs, upstream, testRes ->
+    ) { values ->
+      val settings = values[0] as BridgeSettings
+      val metrics = values[1] as ProxyMetricsSnapshot
+      val serviceMode = values[2] as ServiceBridgeMode
+      @Suppress("UNCHECKED_CAST")
+      val addrs = values[3] as List<NetworkAddressInfo>
+      val upstream = values[4] as UpstreamStatus
+      val testRes = values[5] as TunnelTestResult
       MainUiState(
         settings = settings,
         proxyMetrics = metrics,
+        activeServiceMode = serviceMode,
         activeAddresses = addrs,
         upstreamStatus = upstream,
         tunnelTestResult = testRes,
@@ -58,6 +69,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
 
   init {
+    viewModelScope.launch { prefs.ensureRoomCodeExists() }
     refreshNetworkState()
   }
 
@@ -74,18 +86,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     viewModelScope.launch { prefs.toggleLanguage() }
   }
 
+  fun updateRelayConfig(useRelayMode: Boolean, relayUrl: String, roomCode: String) {
+    viewModelScope.launch { prefs.updateRelayConfig(useRelayMode, relayUrl, roomCode) }
+  }
+
+  fun regenerateRoomCode() {
+    viewModelScope.launch { prefs.regenerateRoomCode() }
+  }
+
   fun updateProxyConfig(port: Int, requirePin: Boolean, pin: String) {
     viewModelScope.launch { prefs.updateProxyConfig(port, requirePin, pin) }
   }
 
-  fun startOrStopBridge(currentlyRunning: Boolean, port: Int, requirePin: Boolean, pin: String) {
+  fun startDirectHost(port: Int, requirePin: Boolean, pin: String) {
     val ctx = getApplication<Application>()
-    if (currentlyRunning) {
-      ProxyBridgeService.stop(ctx)
-    } else {
-      val effectivePin = if (requirePin) pin.takeIf { it.isNotBlank() } else null
-      ProxyBridgeService.start(ctx, port = port, pin = effectivePin)
-    }
+    val effectivePin = if (requirePin) pin.takeIf { it.isNotBlank() } else null
+    ProxyBridgeService.startDirectHost(ctx, port = port, pin = effectivePin)
+    refreshNetworkState()
+  }
+
+  fun startRelayHost(relayUrl: String, roomCode: String, requirePin: Boolean, pin: String) {
+    val ctx = getApplication<Application>()
+    val effectivePin = if (requirePin) pin.takeIf { it.isNotBlank() } else null
+    ProxyBridgeService.startRelayHost(ctx, relayUrl = relayUrl, roomCode = roomCode, pin = effectivePin)
+  }
+
+  fun startRelayFriend(localPort: Int, relayUrl: String, roomCode: String, pin: String?) {
+    val ctx = getApplication<Application>()
+    ProxyBridgeService.startRelayFriend(
+      ctx,
+      localPort = localPort,
+      relayUrl = relayUrl,
+      roomCode = roomCode,
+      pin = pin?.takeIf { it.isNotBlank() },
+    )
+  }
+
+  fun stopBridge() {
+    ProxyBridgeService.stop(getApplication())
     refreshNetworkState()
   }
 
