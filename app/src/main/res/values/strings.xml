@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">NetSetu</string>
+    <string name="notification_channel_bridge">NetSetu Bridge Service</string>
+    <string name="notification_channel_bridge_desc">Shows live status of the active internet sharing proxy bridge.</string>
+    <string name="notification_bridge_title">NetSetu Bridge Active</string>
+    <string name="notification_bridge_stop">Stop Bridge</string>
+</resources>

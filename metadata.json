@@ -1,0 +1,6 @@
+{
+  "name": "NetSetu",
+  "description": "Easy internet sharing bridge with live HTTP/HTTPS proxy server, Wi-Fi QR sharing, Wi-Fi Direct P2P, proxy connectivity tester, and 1-2 km outdoor bridge setup guide.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
